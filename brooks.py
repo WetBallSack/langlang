@@ -31,7 +31,6 @@ import brooks_core as BC
 import brooks_sim as BS
 import langlang as LL
 import floop as F
-import qstats as Q
 
 BLOCKED = {"ETHUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"}
 DEBUG_ONLY = {"BTCUSDT", "SOLUSDT"}
@@ -125,6 +124,92 @@ def ledger_trials():
     if not os.path.exists(LEDGER):
         return 0
     return sum(int(json.loads(l).get("trials", 0)) for l in open(LEDGER))
+
+
+# ====================================================================== STATS (self-contained: no external stats module)
+EULER = 0.5772156649015329
+
+
+@njit(cache=True)
+def _boot_day_ratio(day_sum, day_cnt, B, mean_block, seed):
+    """stationary (Politis-Romano) bootstrap over days of sum(R)/count(trades); mean_block=1 → iid days"""
+    np.random.seed(seed)
+    n = len(day_sum)
+    p = 1.0 / max(mean_block, 1.0)
+    out = np.empty(B)
+    for b in range(B):
+        i = np.random.randint(0, n)
+        s = 0.0
+        c = 0.0
+        for k in range(n):
+            if k > 0 and np.random.random() < p:
+                i = np.random.randint(0, n)
+            s += day_sum[i]
+            c += day_cnt[i]
+            i += 1
+            if i >= n:
+                i = 0
+        out[b] = s / c if c > 0 else 0.0
+    return out
+
+
+def per_trade_mean_ci(day_sum, day_cnt, B=2000, mean_block=1, seed=7, q=(2.5, 97.5)):
+    """mean R per trade with a day-block bootstrap CI (resample days, ratio of sums)"""
+    day_sum = np.asarray(day_sum, float)
+    day_cnt = np.asarray(day_cnt, float)
+    if len(day_sum) == 0 or day_cnt.sum() == 0:
+        return np.nan, np.nan, np.nan
+    bs = _boot_day_ratio(day_sum, day_cnt, int(B), float(mean_block), int(seed))
+    return float(day_sum.sum() / day_cnt.sum()), float(np.percentile(bs, q[0])), float(np.percentile(bs, q[1]))
+
+
+def deflated_sharpe(R, trial_srs, n_trials):
+    """Bailey & López de Prado (2014): P(true SR > expected max SR of n_trials zero-skill trials)"""
+    from scipy.stats import kurtosis, norm, skew
+    R = np.asarray(R, float)
+    if len(R) < 30 or R.std(ddof=1) == 0 or len(trial_srs) < 2:
+        return np.nan
+    sr = R.mean() / R.std(ddof=1)
+    N = max(int(n_trials), len(trial_srs), 2)
+    v = float(np.var(trial_srs, ddof=1))
+    sr0 = math.sqrt(max(v, 1e-12)) * ((1 - EULER) * norm.ppf(1 - 1 / N) + EULER * norm.ppf(1 - 1 / (N * math.e)))
+    g3, g4 = skew(R), kurtosis(R, fisher=False)
+    den = 1 - g3 * sr + (g4 - 1) / 4 * sr ** 2
+    if den <= 0:
+        return np.nan
+    return float(norm.cdf((sr - sr0) * math.sqrt(len(R) - 1) / math.sqrt(den)))
+
+
+def pbo_cscv(M, S=16):
+    """probability of backtest overfitting (combinatorially symmetric cross-validation) on a T x N matrix of
+    per-period returns: share of the C(S, S/2) splits where the in-sample best is below median out of sample"""
+    import itertools
+    M = np.asarray(M, float)
+    if M.ndim != 2:
+        return np.nan
+    T, N = M.shape
+    if N < 2 or T < S * 2:
+        return np.nan
+    edges = np.linspace(0, T, S + 1).astype(int)
+    bsum = np.array([M[edges[i]:edges[i + 1]].sum(0) for i in range(S)])
+    bsq = np.array([(M[edges[i]:edges[i + 1]] ** 2).sum(0) for i in range(S)])
+    bn = np.diff(edges).astype(float)
+    lam = []
+    for combo in itertools.combinations(range(S), S // 2):
+        m = np.zeros(S, bool)
+        m[list(combo)] = True
+
+        def sharpe(mask):
+            k = bn[mask].sum()
+            mu = bsum[mask].sum(0) / k
+            var = bsq[mask].sum(0) / k - mu ** 2
+            return mu / np.sqrt(np.maximum(var, 1e-18))
+        s_is, s_oos = sharpe(m), sharpe(~m)
+        best = int(np.argmax(s_is))
+        rank = (s_oos < s_oos[best]).sum() + 0.5 * ((s_oos == s_oos[best]).sum() - 1) + 1
+        w = rank / (N + 1)
+        lam.append(math.log(w / (1 - w)))
+    return float(np.mean(np.asarray(lam) <= 0))
 
 
 # ====================================================================== DATA
@@ -836,13 +921,13 @@ def cmd_dev(cfg, market):
         b0 = pooled_bench(cfg, prs, tr, "B0")
         b1 = pooled_bench(cfg, prs, tr, "B1")
         ds, dc = day_stats(tr)
-        m, lo, hi = Q.per_trade_mean_ci(ds, dc, B=2000, mean_block=1, seed=cfg.seed, q=(2.5, 97.5))
+        m, lo, hi = per_trade_mean_ci(ds, dc, B=2000, mean_block=1, seed=cfg.seed, q=(2.5, 97.5))
         res[name] = dict(var=var, tr=tr, s=st, stress=summarize(t_s)["mean_R"], b0=b0, b1=b1, ci=(lo, hi))
     days = pd.date_range(*[LL._utc(x) for x in periods(cfg, market, "dev")[1:]], freq="D")
     names = [k for k in res if res[k]["s"]["n"] > 0]
     M = np.column_stack([res[k]["tr"].groupby(res[k]["tr"].exit_time.dt.floor("D")).R.sum()
                          .reindex(days, fill_value=0.0).to_numpy() for k in names]) if names else np.zeros((0, 0))
-    pbo = Q.pbo_cscv(M) if len(names) >= 2 else np.nan
+    pbo = pbo_cscv(M) if len(names) >= 2 else np.nan
     srs = [res[k]["s"]["mean_R"] / res[k]["tr"].R.std(ddof=1) for k in names if res[k]["s"]["n"] > 30]
     n_trials = max(30, ledger_trials() + len(VARIANTS) + 2 * len(NEIGHBOURS))
     rows = []
@@ -862,7 +947,7 @@ def cmd_dev(cfg, market):
     if len(cand):
         best = cand.sort_values("mean_R", ascending=False).iloc[0]
         chosen = best.variant
-        dsr = Q.deflated_sharpe(res[chosen]["tr"].R.to_numpy(), srs, n_trials)
+        dsr = deflated_sharpe(res[chosen]["tr"].R.to_numpy(), srs, n_trials)
         nb = neighbour_runs(cfg, market, prs, res[chosen]["var"])
         frac_pos = float(np.mean(np.array(list(nb.values())) > 0)) if nb else 0.0
         gates["3 DSR > 0.95"] = (np.isfinite(dsr) and dsr > 0.95, f"{dsr:.2f} (N={n_trials})")
