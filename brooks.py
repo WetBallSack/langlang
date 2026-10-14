@@ -100,7 +100,7 @@ def params_of(cfg):
 def freeze_hash(cfg):
     d = {k: v for k, v in dataclasses.asdict(cfg).items() if k not in ("cache_dir", "vision_workers", "n_bench")}
     blob = json.dumps({"cfg": d, "variants": VARIANTS, "defaults": BC.DEFAULTS, "neighbours": NEIGHBOURS,
-                       "design": "BPA-1.0"}, sort_keys=True, default=str)
+                       "design": "BPA-1.1"}, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -325,6 +325,35 @@ def spy_bars(cfg, sym, start, end, tf):
     return df.loc[(df.index >= LL._utc(start) - pd.Timedelta(days=40)) & (df.index < LL._utc(end) + pd.Timedelta(days=1))]
 
 
+def clean_rth_1m(df, verbose=True):
+    """(1) early-close days (Jul 3, Black Friday, Dec 24): drop after-hours bars after 13:00 ET when the
+    afternoon holds < 5% of the day's volume; (2) bad prints: clip isolated wicks larger than 10x the typical 1m
+    range and 15 bp of price that neither neighbouring bar confirms."""
+    if df is None or df.empty:
+        return df
+    loc = df.index.tz_convert("America/New_York")
+    day = loc.normalize()
+    pm = np.asarray(loc.hour >= 13)
+    vol = df["volume"].to_numpy(float)
+    g = pd.DataFrame({"d": day, "pm": pm * vol, "v": vol}).groupby("d")[["pm", "v"]].sum()
+    early = set(g.index[(g.pm < 0.05 * g.v) & (g.v > 0)])
+    keep = ~(pd.Series(day).isin(early).to_numpy() & pm)
+    out = df.loc[keep].copy()
+    o, h, l, c = (out[x].to_numpy(float).copy() for x in ("open", "high", "low", "close"))
+    rng = pd.Series(h - l).rolling(61, center=True, min_periods=10).median().to_numpy()
+    body_hi, body_lo = np.maximum(o, c), np.minimum(o, c)
+    hp, hn = np.r_[h[0], h[:-1]], np.r_[h[1:], h[-1]]
+    lp, ln = np.r_[l[0], l[:-1]], np.r_[l[1:], l[-1]]
+    up = (h - body_hi > 10 * rng) & (h - body_hi > 0.0015 * c) & (h > np.maximum(hp, hn) + 5 * rng)
+    dn = (body_lo - l > 10 * rng) & (body_lo - l > 0.0015 * c) & (l < np.minimum(lp, ln) - 5 * rng)
+    h = np.where(up, body_hi + rng, h)
+    l = np.where(dn, body_lo - rng, l)
+    out["high"], out["low"] = h, l
+    if verbose and (len(early) or up.sum() or dn.sum()):
+        print(f"   cleaned: {len(early)} early-close days trimmed, {int(up.sum() + dn.sum())} bad-print wicks clipped")
+    return out
+
+
 def resample(df, rule):
     g = df.groupby(df.index.floor(rule))
     return pd.DataFrame({"open": g.open.first(), "high": g.high.max(), "low": g.low.min(), "close": g.close.last(),
@@ -366,10 +395,8 @@ class Prep:
 
 def bars_for(cfg, market, sym, start, end):
     if market == "spy":
-        b1 = spy_bars(cfg, sym, start, end, "1Min")
-        b5 = spy_bars(cfg, sym, start, end, "5Min")
-        if b5 is None and b1 is not None:
-            b5 = resample(b1, "5min")
+        b1 = clean_rth_1m(spy_bars(cfg, sym, start, end, "1Min"))
+        b5 = resample(b1, "5min") if b1 is not None and len(b1) else None
     else:
         b5 = binance_bars(cfg, sym, start, end, "5m")
         b1 = binance_bars(cfg, sym, start, end, "1m")
@@ -963,7 +990,12 @@ def cmd_audit(cfg, market, per_family=12):
         tr = simulate(cfg, pr, VARIANTS["V1_full"])
         if len(tr):
             allp += audit_charts(pr, tr, out_dir, per_family=max(1, per_family // min(3, len(prs))), seed=cfg.seed)
-    print(f"{len(allp)} charts in {out_dir}/ — open them from the file explorer (tap a .png)")
+    pdf = os.path.join("reports", f"audit_{market}.pdf")
+    if allp:
+        from PIL import Image
+        pages = [Image.open(p).convert("RGB") for p in sorted(allp)]
+        pages[0].save(pdf, save_all=True, append_images=pages[1:], resolution=90)
+    print(f"{len(allp)} charts in {out_dir}/ and all of them in one file: {pdf}")
     return allp
 
 

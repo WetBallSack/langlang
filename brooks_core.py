@@ -18,6 +18,12 @@ DEFAULTS = dict(
     micro_ch=5, climax_ch=10, gap_run=20, h_tol=0.10, ai_conf=0.0, mtr_test=0.5, mtr_expire=60, ff_bars=8,
     ff_h=1.5, ff_age=30, second_entry=10, room=1, tstop_swing=48, tstop_scalp=12, sess_or=18,
     p_f1=0.6, p_f2=0.6, p_f3=0.6, p_f4=0.4, p_f5=0.6, p_f6=0.45,
+    # BPA-1.1 (fidelity fixes from the chart audit)
+    no_late=4,          # US session: no new entries when fewer than this many bars remain (last 20 minutes)
+    f4_window=15,       # F4 second entry: first setup must trigger, fail and be re-tested within this many bars
+    f4_retest=0.25,     # ... the re-test reaches the first setup's low within this many ATR
+    spike_block=2,      # F2: no fade when the last 5 bars hold >= this many strong bars toward the edge
+    or_move=0.5,        # F6: opening reversal needs a move of >= this many ATR from the open into the magnet
 )
 PKEYS = list(DEFAULTS)
 _K = {k: i for i, k in enumerate(PKEYS)}
@@ -27,6 +33,7 @@ K_TIGHT, K_BROAD, K_BOC, K_BOK, K_MC, K_CMC = _K["tight_h"], _K["broad_h"], _K["
 K_GAP, K_HTOL, K_AIC, K_MTRT, K_MTRX, K_FFB = _K["gap_run"], _K["h_tol"], _K["ai_conf"], _K["mtr_test"], _K["mtr_expire"], _K["ff_bars"]
 K_FFH, K_FFA, K_SEC, K_ROOM, K_TSW, K_TSC, K_SOR = _K["ff_h"], _K["ff_age"], _K["second_entry"], _K["room"], _K["tstop_swing"], _K["tstop_scalp"], _K["sess_or"]
 K_P0 = _K["p_f1"]
+K_LATE, K_F4W, K_F4R, K_SPB, K_ORM = _K["no_late"], _K["f4_window"], _K["f4_retest"], _K["spike_block"], _K["or_move"]
 assert [PKEYS[K_P0 + i] for i in range(6)] == ["p_f1", "p_f2", "p_f3", "p_f4", "p_f5", "p_f6"]
 FAM = ["F1_H2L2", "F2_TR_fade", "F3_failed_BO", "F4_reversal", "F5_breakout", "F6_opening"]
 PRIORITY = (3, 2, 0, 4, 1, 5)          # F4 -> F3 -> F1 -> F5 -> F2 -> F6
@@ -242,6 +249,7 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
     ff_bars, ff_h, ff_age, sec_k, use_room = int(P[K_FFB]), P[K_FFH], int(P[K_FFA]), int(P[K_SEC]), P[K_ROOM]
     ts_sw, ts_sc, sess_or = int(P[K_TSW]), int(P[K_TSC]), int(P[K_SOR])
     p0s = P[K_P0:K_P0 + 6]
+    p_late, f4w, f4r, p_spb, p_orm = int(P[K_LATE]), int(P[K_F4W]), P[K_F4R], int(P[K_SPB]), P[K_ORM]
     # ---- state
     st = 0; ai = 0
     box_hi = np.nan; box_lo = np.nan; box_age = 0
@@ -270,15 +278,38 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
     fb_side = 0; fb_t = -1; fb_ext = 0.0
     or_hi = -1e18; or_lo = 1e18; or_done = False; or_bo = 0; or_bt = -1
     ch_id_t = -1; ch_side = 0; ch_top = 0.0; ch_bot = 0.0
+    f4b_t1 = -1; f4b_hi = 0.0; f4b_lo = 0.0; f4b_bn = False; f4b_rt = False      # F4 bull first entry
+    f4s_t1 = -1; f4s_hi = 0.0; f4s_lo = 0.0; f4s_bn = False; f4s_rt = False      # F4 bear first entry
+    sess_hi = -1e18; sess_lo = 1e18
     for t in range(2, n):
         O = FE[t, C_O]; H = FE[t, C_H]; L = FE[t, C_L]; C = FE[t, C_C]
         A = FE[t, C_ATR]; ABR = FE[t, C_ABR]; E = FE[t, C_EMA]
         Hp = FE[t - 1, C_H]; Lp = FE[t - 1, C_L]
+        sbar_t = int(FE[t, C_SBAR])
+        if is_rth and sbar_t == 0:
+            st = 0; ai = 0; box_hi = np.nan; box_lo = np.nan; box_age = 0; bo_side = 0
+            trend_start = -1; trend_ext = 0.0; since_ext = 0; legs = 0; spike_t = -1
+            run_b = 0; run_s = 0; mc_b = 0; mc_s = 0; mc_b_prev = 0; mc_s_prev = 0
+            gr_b = 0; gr_s = 0; last_gr_b = 0; last_gr_s = 0; gr_b_end = -10**9; gr_s_end = -10**9
+            pend_ai_b = -1; pend_ai_s = -1
+            zz_dir = 0; sw_lo = np.nan; sw_hi = np.nan
+            phx[:] = np.nan; phi[:] = -1.0; plx[:] = np.nan; pli[:] = -1.0; alt_px[:] = np.nan; alt_ty[:] = 0.0
+            b_val = False; b_arm = False; b_nl = 0; b_nb = 0; s_val = False; s_arm = False; s_nl = 0; s_nb = 0
+            mt_top = -1; mt_bot = -1; cl_up = -1; cl_dn = -1; ff_side = 0; fb_side = 0
+            f4b_t1 = -1; f4s_t1 = -1; f4_last_b = -10**9; f4_last_s = -10**9
+            sess_hi = H; sess_lo = L
+        elif is_rth:
+            if H > sess_hi:
+                sess_hi = H
+            if L < sess_lo:
+                sess_lo = L
         if not (A == A) or not (ABR == ABR) or A <= 0:
             continue
         # ---------------- pivots confirmed at t (k=2: pivot at t-2)
         j = t - 2
-        if FE[j, C_PH2] > 0:
+        if is_rth and FE[j, C_DAY] != FE[t, C_DAY]:
+            j = -1
+        if j >= 0 and FE[j, C_PH2] > 0:
             for q in range(5):
                 phx[q] = phx[q + 1]; phi[q] = phi[q + 1]
             phx[5] = FE[j, C_H]; phi[5] = j
@@ -288,7 +319,7 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
                 for q in range(5):
                     alt_px[q] = alt_px[q + 1]; alt_ty[q] = alt_ty[q + 1]
                 alt_px[5] = FE[j, C_H]; alt_ty[5] = 1
-        if FE[j, C_PL2] > 0:
+        if j >= 0 and FE[j, C_PL2] > 0:
             for q in range(5):
                 plx[q] = plx[q + 1]; pli[q] = pli[q + 1]
             plx[5] = FE[j, C_L]; pli[5] = j
@@ -418,13 +449,29 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
         gap_first_s = gr_b == 1 and last_gr_s >= p_gap and t - gr_s_end <= 20
         # ---------------- market cycle and always-in
         hh20 = FE[t, C_HH20]; ll20 = FE[t, C_LL20]
+        ema_b = C > E
+        ema_s = C < E
+        if is_rth:
+            if sbar_t >= 1:
+                k0 = max(t - 20, t - sbar_t)
+                rh = -1e18; rl = 1e18
+                for q in range(k0, t):
+                    if FE[q, C_H] > rh:
+                        rh = FE[q, C_H]
+                    if FE[q, C_L] < rl:
+                        rl = FE[q, C_L]
+                hh20 = rh; ll20 = rl
+                if sbar_t < 20:                   # opening spikes count even on the "wrong" side of a lagging EMA
+                    ema_b = True; ema_s = True
+            else:
+                hh20 = np.nan; ll20 = np.nan
         spike_up = hh20 == hh20 and C > hh20 and ((run_b >= p_srun and C - run_b0 >= p_smove * A) or FE[t, C_SURU] > 0)
         spike_dn = ll20 == ll20 and C < ll20 and ((run_s >= p_srun and run_s0 - C >= p_smove * A) or FE[t, C_SURD] > 0)
-        if spike_up and C > E:
+        if spike_up and ema_b:
             if st <= 0:
                 trend_start = t; legs = 0; trend_ext = H; since_ext = 0
             st = 1; ai = 1; bo_side = 0; spike_t = t
-        elif spike_dn and C < E:
+        elif spike_dn and ema_s:
             if st >= 0:
                 trend_start = t; legs = 0; trend_ext = L; since_ext = 0
             st = -1; ai = -1; bo_side = 0; spike_t = t
@@ -570,6 +617,14 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
         sigB = FE[t, C_SIGB]; sigS = FE[t, C_SIGS]; cpos = FE[t, C_CPOS]
         good_b = sigB >= p_sig; good_s = sigS >= p_sig
         TS = FE[t, C_TS]
+        n_bt = 0; n_st = 0; n_sb = 0; n_ss = 0
+        for q in range(t - 4, t + 1):
+            n_bt += 1 if FE[q, C_BTB] > 0 else 0
+            n_st += 1 if FE[q, C_STB] > 0 else 0
+            n_sb += 1 if FE[q, C_SB] > 0 else 0
+            n_ss += 1 if FE[q, C_SS] > 0 else 0
+        spiky_up = n_sb >= p_spb or n_bt >= 4
+        spiky_dn = n_ss >= p_spb or n_st >= 4
         # pattern detectors
         db = False; dt = False
         if plx[5] == plx[5] and t - pli[5] <= 80 and t - pli[5] >= 3 and phi[5] > pli[5]:
@@ -633,13 +688,13 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
                     te = 1.0 if (use_room < 0.5 or _room(-1, e, e - (sa - e), t, FE, box_hi, box_lo, in_tr, lph, lpl)) else 0.0
                     _emit(IT, GATE, t, 0, -1, T_STOP, e, sa, sb_, e - (sa - e), tgb, 0.5, 1, ts_sw, p0s[0], te, 1)
         # ---------------- F2 trading-range fade (buy low, sell high, scalp)
-        if GATE[t, 1] == 1 and good_b and (b_next == 2 or db or wb or mdb):
+        if GATE[t, 1] == 1 and good_b and not spiky_dn and (b_next == 2 or db or wb or mdb):
             e = H + tick; sa = L - tick; tg = min(e + (e - sa), box_mid)
             if tg > e:
                 rr = (tg - e) / (e - sa)
                 te = 1.0 if p0s[1] * rr - (1 - p0s[1]) > 0 and (use_room < 0.5 or _room(1, e, tg, t, FE, np.nan, np.nan, False, lph, lpl)) else 0.0
                 _emit(IT, GATE, t, 1, 1, T_STOP, e, sa, sa, tg, tg, 1.0, 0, ts_sc, p0s[1], te, 1)
-        if GATE[t, 1] == -1 and good_s and (s_next == 2 or dt or wt or mdt):
+        if GATE[t, 1] == -1 and good_s and not spiky_up and (s_next == 2 or dt or wt or mdt):
             e = L - tick; sa = H + tick; tg = max(e - (sa - e), box_mid)
             if tg < e:
                 rr = (e - tg) / (sa - e)
@@ -675,6 +730,17 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
             (wt and (climax_up or (in_tr and C >= box_hi - third) or mt_top >= 0)) or
             (dt and in_tr and C >= box_hi - third) or ett or
             (ff_side == 1 and t - ff_t <= bo_k and C < ff_hi))
+        # the re-test may be the new signal bar itself; the bounce (first entry triggered) must come before it
+        if f4b_t1 >= 0:
+            if t - f4b_t1 > f4w:
+                f4b_t1 = -1
+            elif t > f4b_t1 and f4b_bn and L <= f4b_lo + f4r * A:
+                f4b_rt = True
+        if f4s_t1 >= 0:
+            if t - f4s_t1 > f4w:
+                f4s_t1 = -1
+            elif t > f4s_t1 and f4s_bn and H >= f4s_hi - f4r * A:
+                f4s_rt = True
         if bull_setup:
             if mt_bot >= 0 and L <= mt_lo + p_mtrt * A and not mt_bot_rec:
                 _add_ev(EV, evn, EV_MTR, t, 1, H + tick, min(L, Lp) - tick, 0, 0, 0, 0, 0, 0)
@@ -682,15 +748,15 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
             if ff_side == -1 and not ff_rec:
                 _add_ev(EV, evn, EV_FF, t, 1, H + tick, min(L, Lp) - tick, 0, 0, 0, 0, 0, 0)
                 ff_rec = True
-            if t - f4_last_b <= sec_k:
+            if f4b_t1 >= 0 and f4b_bn and f4b_rt and t - f4b_t1 >= 2:
                 e = H + tick; sa = min(L, Lp, FE[t - 2, C_L]) - tick; tg = e + 2 * (e - sa)
                 te = 1.0 if (p0s[3] * 2 - (1 - p0s[3]) > 0) and (use_room < 0.5 or _room(1, e, tg, t, FE, box_hi, box_lo, in_tr, lph, np.nan)) else 0.0
                 _emit(IT, GATE, t, 3, 1, T_STOP, e, sa, sa, tg, tg, 1.0, 1, ts_sw, p0s[3], te, 1)
-                f4_last_b = -10**9
+                f4b_t1 = -1
                 if mt_bot >= 0:
                     mt_bot = -1
-            else:
-                f4_last_b = t
+            elif f4b_t1 < 0 or not f4b_bn:                     # (re)start the first entry; adjacent bars are not 2nd
+                f4b_t1 = t; f4b_hi = H; f4b_lo = min(L, Lp); f4b_bn = False; f4b_rt = False
         if bear_setup:
             if mt_top >= 0 and H >= mt_hi - p_mtrt * A and not mt_top_rec:
                 _add_ev(EV, evn, EV_MTR, t, -1, L - tick, max(H, Hp) + tick, 0, 0, 0, 0, 0, 0)
@@ -698,15 +764,19 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
             if ff_side == 1 and not ff_rec:
                 _add_ev(EV, evn, EV_FF, t, -1, L - tick, max(H, Hp) + tick, 0, 0, 0, 0, 0, 0)
                 ff_rec = True
-            if t - f4_last_s <= sec_k:
+            if f4s_t1 >= 0 and f4s_bn and f4s_rt and t - f4s_t1 >= 2:
                 e = L - tick; sa = max(H, Hp, FE[t - 2, C_H]) + tick; tg = e - 2 * (sa - e)
                 te = 1.0 if (use_room < 0.5 or _room(-1, e, tg, t, FE, box_hi, box_lo, in_tr, np.nan, lpl)) else 0.0
                 _emit(IT, GATE, t, 3, -1, T_STOP, e, sa, sa, tg, tg, 1.0, 1, ts_sw, p0s[3], te, 1)
-                f4_last_s = -10**9
+                f4s_t1 = -1
                 if mt_top >= 0:
                     mt_top = -1
-            else:
-                f4_last_s = t
+            elif f4s_t1 < 0 or not f4s_bn:
+                f4s_t1 = t; f4s_hi = max(H, Hp); f4s_lo = L; f4s_bn = False; f4s_rt = False
+        if f4b_t1 >= 0 and t > f4b_t1 and H >= f4b_hi + tick:
+            f4b_bn = True
+        if f4s_t1 >= 0 and t > f4s_t1 and L <= f4s_lo - tick:
+            f4s_bn = True
         # ---------------- F5 strong breakout: buy the close of the follow-through bar (bar t follows breakout bar b)
         b = t - 1
         if b >= 7 and OUT[b - 1, 0] == 0 and OUT[b - 1, 4] >= 5:
@@ -757,13 +827,16 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
                 or_hi = max(or_hi, H); or_lo = min(or_lo, L)
             left = int(FE[t, C_LEFT])
             if 0 <= sb_ < sess_or and left >= 2:
-                mags = (FE[t, C_PDL], FE[t, C_PCL], FE[t, C_DOP], E, FE[t, C_PDH])
+                mags = (FE[t, C_PDL], FE[t, C_PCL], E, FE[t, C_PDH])
+                dop = FE[t, C_DOP]
+                moved_dn = dop - sess_lo >= p_orm * A and L <= sess_lo + 0.1 * A
+                moved_up = sess_hi - dop >= p_orm * A and H >= sess_hi - 0.1 * A
                 near_b = False; near_s = False
                 for m in mags:
                     if m == m:
-                        if abs(L - m) <= 0.5 * A:
+                        if moved_dn and abs(L - m) <= 0.5 * A:
                             near_b = True
-                        if abs(H - m) <= 0.5 * A:
+                        if moved_up and abs(H - m) <= 0.5 * A:
                             near_s = True
                 GATE[t, 5] = 1 if near_b else (-1 if near_s else 0)
                 if near_b and good_b and sb_ >= 1:
@@ -794,6 +867,11 @@ def engine(FE, P, tick, is_rth, OUT, IT, GATE, EV, evn):
                             _emit(IT, GATE, t, 5, or_bo, T_MARKET, e, sa, sa, e + 2 * (e - sa), e + 2 * (e - sa), 1.0, 0, left,
                                   p0s[5], 1.0, 1)
                     or_done = True
+        if is_rth and (sbar_t == 0 or FE[t, C_LEFT] < p_late):
+            for f in range(6):
+                for q in range(NI):
+                    IT[t, f, q] = 0.0
+                GATE[t, f] = 0.0
         # ---------------- outputs
         OUT[t, 0] = st; OUT[t, 1] = ai; OUT[t, 2] = box_hi; OUT[t, 3] = box_lo; OUT[t, 4] = box_age
         OUT[t, 5] = trend_age; OUT[t, 6] = b_nl; OUT[t, 7] = s_nl; OUT[t, 8] = 1.0 if bw else 0.0

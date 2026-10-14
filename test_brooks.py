@@ -388,6 +388,126 @@ def test_regressions():
     check("parameters are wired by name (a larger zig-zag threshold gives fewer swings)", sw[0.75] > sw[1.5] > 0, str(sw))
 
 
+# ---------------------------------------------------------------- 7. BPA-1.1 fidelity fixes (from the chart audit)
+def rth_sessions(n_days=60, seed=8, drift_sd=0.0004, start="2016-03-01", vol_pm=1.0):
+    rng = np.random.default_rng(seed)
+    days = pd.bdate_range(start, periods=n_days)
+    rows, idx = [], []
+    px = 200.0
+    for d in days:
+        t0 = pd.Timestamp(d.strftime("%Y-%m-%d") + " 09:30", tz="America/New_York").tz_convert("UTC")
+        px *= math.exp(rng.normal(0, 0.004))                      # overnight gap
+        drift = rng.normal(0, drift_sd)
+        for k in range(390):
+            r = drift + rng.normal(0, 0.0007)
+            o = px; c = px * math.exp(r); px = c
+            v = 1000.0 if k < 210 else 1000.0 * vol_pm
+            rows.append([o, max(o, c) * (1 + abs(rng.normal(0, 0.0002))), min(o, c) * (1 - abs(rng.normal(0, 0.0002))), c, v])
+            idx.append(t0 + pd.Timedelta(minutes=k))
+    return pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=pd.DatetimeIndex(idx))
+
+
+def test_v11():
+    df1 = rth_sessions()
+    d5 = BR.resample(df1, "5min")
+    P = BC.pvec()
+    FE = BC.features(d5, P, "rth")
+    OUT, IT, GATE, EV = BC.run_engine(FE, P, 0.01, True)
+    sbar, left = FE[:, BC.C_SBAR], FE[:, BC.C_LEFT]
+    has = (IT[:, :, 0] != 0).any(axis=1)
+    first = sbar == 0
+    check("v1.1: no entries on the session's first bar or in its last 20 minutes",
+          has.sum() > 50 and not has[first].any() and not has[left < 4].any(), f"{int(has.sum())} signal bars")
+    fo = first & ~np.isnan(OUT[:, 0])                              # skip the indicator warm-up bars
+    check("v1.1: counts, trend state and always-in reset at the US open",
+          fo.sum() > 40 and np.all(OUT[fo, 6] == 0) and np.all(OUT[fo, 7] == 0) and np.all(OUT[fo, 1] == 0)
+          and np.all(OUT[fo, 0] == 0), f"{int(fo.sum())} session opens")
+    # gap up, then a strong sell-off that never makes a new 20-bar (prior-day) low → always-in flips short
+    rows = []
+    p = 100.0
+    for i in range(80):                                            # day 1: grind up to 104
+        rows.append([p, p + 0.3, p - 0.2, p + 0.05]); p += 0.05
+    t1 = pd.date_range("2016-03-01 14:30", periods=78, freq="5min", tz="UTC")
+    t2 = pd.date_range("2016-03-02 14:30", periods=78, freq="5min", tz="UTC")
+    gap = p + 3.0
+    day2 = [[gap, gap + 0.1, gap - 0.05, gap]]
+    q = gap
+    for i in range(4):                                             # four big bear bars, still far above day-1 lows
+        day2.append([q, q + 0.02, q - 0.62, q - 0.6]); q -= 0.6
+    for i in range(73):
+        day2.append([q, q + 0.2, q - 0.2, q])
+    idx = t1.append(t2)
+    rows = rows[:78] + day2
+    d = pd.DataFrame(rows, columns=["open", "high", "low", "close"], index=idx).assign(volume=1.0)
+    FE2 = BC.features(d, P, "rth")
+    OUT2, *_ = BC.run_engine(FE2, P, 0.01, True)
+    k = 78 + 4
+    check("v1.1: a strong sell-off from a gap-up flips always-in short (spikes measured within the session)",
+          OUT2[k, 1] == -1 and FE2[k, BC.C_L] > FE2[:78, BC.C_L].min(), f"always-in {OUT2[k, 1]:+.0f}, state {OUT2[k, 0]:+.0f}")
+    # F4: every trade is a real second entry
+    df1c = MF.gbm1m("2024-01-01", 120, 5, p0=100.0, vol=0.0012, drift=0.00004)
+    d5c = to5(df1c)
+    FEc = BC.features(d5c, P)
+    OUTc, ITc, _, _ = BC.run_engine(FEc, P, 0.01, False)
+    H, L, A = FEc[:, BC.C_H], FEc[:, BC.C_L], FEc[:, BC.C_ATR]
+    bad = 0
+    f4 = np.flatnonzero(ITc[:, 3, 0] != 0)
+    for t_ in f4:
+        side = ITc[t_, 3, 0]
+        ok = False
+        for t1_ in range(max(2, t_ - 15), t_ - 1):
+            if side > 0:
+                if FEc[t1_, BC.C_SIGB] >= 4 and H[t1_ + 1:t_].max(initial=-1e18) >= H[t1_] + 0.01 and \
+                        L[t1_ + 1:t_ + 1].min() <= min(L[t1_], L[t1_ - 1]) + 0.25 * A[t1_:t_ + 1].max() + 1e-9:
+                    ok = True
+                    break
+            else:
+                if FEc[t1_, BC.C_SIGS] >= 4 and L[t1_ + 1:t_].min(initial=1e18) <= L[t1_] - 0.01 and \
+                        H[t1_ + 1:t_ + 1].max() >= max(H[t1_], H[t1_ - 1]) - 0.25 * A[t1_:t_ + 1].max() - 1e-9:
+                    ok = True
+                    break
+        bad += not ok
+    check("v1.1: every F4 reversal is a real second entry (first signal triggered, failed, re-tested, new signal)",
+          len(f4) > 10 and bad == 0, f"{len(f4)} F4 intents, {bad} without the structure")
+    f2 = np.argwhere(ITc[:, 1, 0] != 0).ravel()
+    viol = 0
+    for t_ in f2:
+        side = ITc[t_, 1, 0]
+        w = slice(t_ - 4, t_ + 1)
+        if side > 0 and (FEc[w, BC.C_SS].sum() >= 2 or FEc[w, BC.C_STB].sum() >= 4):
+            viol += 1
+        if side < 0 and (FEc[w, BC.C_SB].sum() >= 2 or FEc[w, BC.C_BTB].sum() >= 4):
+            viol += 1
+    check("v1.1: F2 never fades a strong spike into the range edge", len(f2) > 10 and viol == 0, f"{len(f2)} F2 intents")
+    # F6 opening reversals follow a move from the open into the magnet
+    f6 = [t_ for t_ in np.flatnonzero(IT[:, 5, 0] != 0) if IT[t_, 5, 1] == BC.T_STOP]
+    bad6 = 0
+    for t_ in f6:
+        d0 = t_ - int(sbar[t_])
+        side = IT[t_, 5, 0]
+        lo, hi = FE[d0:t_ + 1, BC.C_L].min(), FE[d0:t_ + 1, BC.C_H].max()
+        op = FE[t_, BC.C_DOP]
+        if side > 0 and not (op - lo >= 0.5 * FE[t_, BC.C_ATR] - 1e-9):
+            bad6 += 1
+        if side < 0 and not (hi - op >= 0.5 * FE[t_, BC.C_ATR] - 1e-9):
+            bad6 += 1
+    check("v1.1: F6 opening reversals follow a ≥0.5 ATR move from the open (no more EMA-pullback 'reversals')",
+          len(f6) > 5 and bad6 == 0, f"{len(f6)} opening reversals")
+    # data cleaning: a bad print and an early-close afternoon
+    raw = rth_sessions(n_days=3, seed=3, vol_pm=1.0)
+    raw.iloc[100, raw.columns.get_loc("high")] = raw.iloc[100]["close"] * 1.03        # isolated spike, ~20x the 1m range
+    hd = rth_sessions(n_days=1, seed=4, start="2018-12-24", vol_pm=0.001)              # after 13:00: almost no volume
+    allb = pd.concat([raw, hd])
+    with contextlib.redirect_stdout(io.StringIO()):
+        cl = BR.clean_rth_1m(allb)
+    spike_fixed = cl.loc[raw.index[100], "high"] < raw.iloc[100]["close"] * 1.01        # was +3%
+    hd_loc = cl.index.tz_convert("America/New_York")
+    late = ((hd_loc.normalize() == pd.Timestamp("2018-12-24", tz="America/New_York")) & (hd_loc.hour >= 13)).sum()
+    normal_pm = ((hd_loc.normalize() != pd.Timestamp("2018-12-24", tz="America/New_York")) & (hd_loc.hour >= 13)).sum()
+    check("v1.1 data: bad-print wick clipped; half-day after-hours bars dropped; normal afternoons kept",
+          spike_fixed and late == 0 and normal_pm == 3 * 180, f"half-day late bars {late}, normal afternoon bars {normal_pm}")
+
+
 if __name__ == "__main__":
     t0 = time.time()
     test_definitions()
@@ -397,6 +517,7 @@ if __name__ == "__main__":
     test_zero_edge()
     test_claims_null()
     test_regressions()
+    test_v11()
     test_crypto_workflow()
     test_spy_workflow()
     test_speed()
