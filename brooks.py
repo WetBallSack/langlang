@@ -260,11 +260,30 @@ def _alpaca_get(params):
 ALPACA_GET = _alpaca_get
 
 
+def _alpaca_keys():
+    key = os.environ.get("ALPACA_API_KEY") or os.environ.get("APCA_API_KEY_ID")
+    sec = os.environ.get("ALPACA_SECRET_KEY") or os.environ.get("APCA_API_SECRET_KEY")
+    return bool(key and sec)
+
+
+ALPACA_FIRST_YEAR = 2016                  # Alpaca's historical stock data starts in 2016
+
+
 def alpaca_year(cfg, sym, tf, year):
+    """one calendar year of bars, cached. Years before Alpaca's history are skipped without a request; empty
+    years are cached too; without API keys a cached (even stale) year is used instead of failing."""
+    if year < ALPACA_FIRST_YEAR:
+        return None
     path = os.path.join(cfg.cache_dir, "alpaca", f"{sym}_{tf}_{year}.pkl")
     now = LL._now()
-    if os.path.exists(path) and (year < now.year or time.time() - os.path.getmtime(path) < 6 * 3600):
-        return pd.read_pickle(path)
+    keys = ALPACA_GET is not _alpaca_get or _alpaca_keys()
+    if os.path.exists(path):
+        fresh = year < now.year or time.time() - os.path.getmtime(path) < 6 * 3600
+        if fresh or not keys:
+            if not fresh:
+                print(f"   {sym} {tf} {year}: no Alpaca keys set — using the cached copy (not refreshed)")
+            df = pd.read_pickle(path)
+            return None if df.empty else df
     rows, token = [], None
     end = min(pd.Timestamp(f"{year + 1}-01-01", tz="UTC"), now - pd.Timedelta(minutes=20))
     while True:
@@ -277,13 +296,14 @@ def alpaca_year(cfg, sym, tf, year):
         token = js.get("next_page_token")
         if not token:
             break
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     if not rows:
+        pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).to_pickle(path)    # remember "no data"
         return None
     df = pd.DataFrame(rows)
     df.index = pd.to_datetime(df["t"], utc=True).dt.as_unit("ns")
     df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})[
         ["open", "high", "low", "close", "volume"]].astype(float)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     df.to_pickle(path)
     return df
 
@@ -866,6 +886,87 @@ def cmd_claims(cfg, market):
     return tab
 
 
+# ====================================================================== AUDIT CHARTS (fidelity check by eye)
+STATE_NAME = {0: "trading range", 1: "bull spike", 2: "bull channel", -1: "bear spike", -2: "bear channel"}
+REASON_NAME = {BS.R_STOP: "stop", BS.R_TARGET: "target", BS.R_TIME: "time stop", BS.R_SESSION: "US close",
+               BS.R_REVERSE: "reversed", BS.R_END: "end of data"}
+
+
+def audit_charts(pr: Prep, tr: pd.DataFrame, out_dir, per_family=12, seed=7, before=60, after=15):
+    """draw candles around randomly chosen trades: signal bar, entry, stops, targets, exit, 20 EMA, context.
+    Returns the list of PNG paths."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    os.makedirs(out_dir, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    FE, OUT, IT = pr.FE, pr.OUT, pr.IT
+    paths = []
+    for f in sorted(tr.fam.unique()):
+        sub = tr[tr.fam == f]
+        pick = sub.iloc[rng.choice(len(sub), min(per_family, len(sub)), replace=False)].sort_values("sig_bar")
+        for k, (_, t) in enumerate(pick.iterrows()):
+            s, e, x = int(t.sig_bar), int(t.entry_bar), int(t.exit_bar)
+            a = max(0, s - before)
+            z = min(len(FE) - 1, max(x, e) + after, s + before + 60)
+            idx = np.arange(a, z + 1)
+            O, H, L, C = (FE[idx, c] for c in (BC.C_O, BC.C_H, BC.C_L, BC.C_C))
+            fig, ax = plt.subplots(figsize=(13, 6.5), dpi=90)
+            for i in range(len(idx)):
+                up = C[i] >= O[i]
+                col = "#2e7d32" if up else "#c62828"
+                ax.vlines(i, L[i], H[i], color=col, linewidth=0.9)
+                ax.add_patch(plt.Rectangle((i - 0.32, min(O[i], C[i])), 0.64, max(abs(C[i] - O[i]), 1e-9),
+                                           facecolor=col if not up else "white", edgecolor=col, linewidth=0.9))
+            ax.plot(np.arange(len(idx)), FE[idx, BC.C_EMA], color="#1565c0", linewidth=1.1, label="20 EMA")
+            si, ei, xi = s - a, e - a, x - a
+            ax.axvspan(si - 0.5, si + 0.5, color="#fff59d", alpha=0.8, zorder=0, label="signal bar")
+            ent = IT[s, f, BC.I_EPX]
+            ax.hlines(ent, si, xi, colors="black", linestyles="--", linewidth=1.0, label=f"entry {ent:.4g}")
+            ax.hlines(IT[s, f, BC.I_STA], si, xi, colors="#c62828", linewidth=1.2, label="stop")
+            if IT[s, f, BC.I_FRA] < 0.999:
+                ax.hlines(IT[s, f, BC.I_STB], si, xi, colors="#ef9a9a", linewidth=1.0, label="swing stop (2nd half)")
+            ax.hlines(IT[s, f, BC.I_TGA], si, xi, colors="#2e7d32", linewidth=1.2, label="target")
+            if IT[s, f, BC.I_FRA] < 0.999:
+                ax.hlines(IT[s, f, BC.I_TGB], si, xi, colors="#a5d6a7", linewidth=1.0, label="target (2nd half)")
+            ax.axvline(xi, color="grey", linewidth=0.8, linestyle=":")
+            ax.annotate(f"exit: {REASON_NAME.get(int(t.reason), t.reason)}", (xi, H.max()), fontsize=9, ha="center")
+            if OUT[s, 0] == 0 and OUT[s, 2] == OUT[s, 2]:
+                ax.hlines([OUT[s, 2], OUT[s, 3]], 0, si, colors="#8e24aa", linewidths=0.8, linestyles="-.",
+                          label="range box")
+            when = pd.Timestamp(pr.t5[s], tz="UTC")
+            if pr.rth:
+                when = when.tz_convert("America/New_York")
+            ttl = (f"{pr.sym}  {BC.FAM[f]}  {'LONG' if t.side > 0 else 'SHORT'}  signal {when:%Y-%m-%d %H:%M}"
+                   f"  |  context: {STATE_NAME.get(int(OUT[s, 0]), '?')}, always-in "
+                   f"{'long' if OUT[s, 1] > 0 else 'short' if OUT[s, 1] < 0 else 'none'}, H-count {int(OUT[s, 6])} / "
+                   f"L-count {int(OUT[s, 7])}  |  result {t.R:+.2f}R")
+            ax.set_title(ttl, fontsize=10)
+            ax.set_xlim(-1, len(idx))
+            ax.legend(fontsize=7, loc="upper left", ncol=4)
+            ax.grid(alpha=0.2)
+            p = os.path.join(out_dir, f"{BC.FAM[f]}_{k + 1:02d}_{pr.sym}.png")
+            fig.tight_layout()
+            fig.savefig(p)
+            plt.close(fig)
+            paths.append(p)
+    return paths
+
+
+def cmd_audit(cfg, market, per_family=12):
+    """charts of random dev trades per family (variant V1, all families) so a Brooks trader can judge fidelity"""
+    P = BC.pvec(**params_of(cfg))
+    prs = preps(cfg, market, "dev", P)
+    out_dir = os.path.join("reports", f"audit_{market}")
+    allp = []
+    for pr in prs[:3]:
+        tr = simulate(cfg, pr, VARIANTS["V1_full"])
+        if len(tr):
+            allp += audit_charts(pr, tr, out_dir, per_family=max(1, per_family // min(3, len(prs))), seed=cfg.seed)
+    print(f"{len(allp)} charts in {out_dir}/ — open them from the file explorer (tap a .png)")
+    return allp
+
+
 # ====================================================================== EXPERIMENT
 def _vars_for(market):
     return OrderedDict((k, v) for k, v in VARIANTS.items() if market == "spy" or k != "V6_F6_opening")
@@ -1045,7 +1146,7 @@ def cmd_backtest(cfg, market, sym, start, end, variant):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["download", "claims", "firerate", "dev", "holdout", "backtest", "ticks"])
+    ap.add_argument("cmd", choices=["download", "claims", "firerate", "dev", "holdout", "backtest", "ticks", "audit"])
     ap.add_argument("--market", choices=["spy", "crypto"], default="crypto")
     ap.add_argument("--sym", default="LTCUSDT")
     ap.add_argument("--start", default="2023-01-01")
@@ -1062,6 +1163,7 @@ def main(argv=None):
     {"download": lambda: cmd_download(cfg, a.market), "claims": lambda: cmd_claims(cfg, a.market),
      "firerate": lambda: cmd_firerate(cfg, a.market), "dev": lambda: cmd_dev(cfg, a.market),
      "holdout": lambda: cmd_holdout(cfg, a.market, a.force_new_trial), "ticks": lambda: cmd_ticks(cfg),
+     "audit": lambda: cmd_audit(cfg, a.market),
      "backtest": lambda: cmd_backtest(cfg, a.market, a.sym, a.start, a.end, a.variant)}[a.cmd]()
 
 
